@@ -1,0 +1,19 @@
+# AWS SDK and core dependencies
+boto3>=1.38.16
+
+# CLI framework and argument parsing
+typer>=0.15.3
+typing-extensions>=4.13.2
+
+# Template rendering (for launch wizard user data templates)
+chevron>=0.14.0
+
+# Rich console output and UI
+rich>=14.0.0
+
+# HTTP requests (for storage array API calls)
+requests>=2.25.0
+
+# Storage vendor SDKs
+netapp-ontap>=9.16.1.0
+py-pure-client>=1.67.2

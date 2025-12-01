@@ -1,0 +1,238 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for Outpost monitoring with email notifications only (manual recovery required)
+
+Parameters:
+  StackName:
+    Type: String
+    Description: "Name of the CloudFormation stack"
+  SourceInstanceId:
+    Type: String
+    Description: "ID of the source instance to monitor"
+  NotificationEmail:
+    Type: String
+    Description: "Email address for SNS notifications"
+  VpcId:
+    Type: String
+    Description: "VPC ID where the source instance is located"
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: "Comma-delimited list of subnet IDs for Lambda function (private subnets with internet access)"
+
+Resources:
+  KMSKey:
+    Type: AWS::KMS::Key
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Properties:
+      Description: 'KMS key for encrypting SNS topic data'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+          - Sid: Allow administration of the key
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - 'kms:*'
+            Resource: '*'
+          - Sid: Allow Cloudwatch to use the key
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+
+  KMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-kmskey'
+      TargetKeyId: !Ref KMSKey
+
+  EmailSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "Outpost Server Email Notification"
+      KmsMasterKeyId: !Ref KMSKey
+
+  EmailSNSTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !Ref EmailSNSTopic
+
+  NotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref EmailSNSTopic
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt KMSKey.Arn
+
+  NotificationLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for notification Lambda function
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for AWS API calls
+
+  NotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt NotificationLambdaRole.Arn
+      Runtime: python3.8
+      Timeout: 60
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref NotificationLambdaSecurityGroup
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          STACK_NAME: !Ref StackName
+          SOURCE_INSTANCE_ID: !Ref SourceInstanceId
+          EMAIL_SNS_TOPIC_ARN: !Ref EmailSNSTopic
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import json
+          
+          def get_launch_template_ids(stack_name):
+              cloudformation = boto3.client("cloudformation")
+              try:
+                  stack_details = cloudformation.describe_stacks(StackName=stack_name)
+                  outputs = stack_details["Stacks"][0]["Outputs"]
+                  launch_templates = []
+                  for output in outputs:
+                      if output["OutputKey"].startswith("LaunchTemplateId"):
+                          launch_templates.append({
+                              'id': output["OutputValue"],
+                              'description': output.get("Description", "")
+                          })
+                  return launch_templates
+              except Exception as e:
+                  print(f"Error retrieving launch template IDs: {str(e)}")
+                  return []
+          
+          def lambda_handler(event, context):
+              stack_name = os.getenv("STACK_NAME")
+              source_instance_id = os.getenv("SOURCE_INSTANCE_ID")
+              email_sns_topic_arn = os.getenv("EMAIL_SNS_TOPIC_ARN")
+              
+              print(f"Received event: {event}")
+              
+              try:
+                  launch_templates = get_launch_template_ids(stack_name)
+                  
+                  template_info = ""
+                  if launch_templates:
+                      template_info = "\n\nAvailable Launch Templates for Manual Recovery:\n"
+                      for i, template in enumerate(launch_templates, 1):
+                          template_info += f"{i}. {template['id']} - {template['description']}\n"
+                      template_info += "\nTo manually recover, use the AWS Console or CLI to launch instances using these templates."
+                  
+                  message = f"""INSTANCE FAILURE ALERT
+          
+Instance {source_instance_id} has failed status checks for 4 consecutive minutes.
+          
+MANUAL RECOVERY REQUIRED:
+This system is configured for notification-only mode. You must manually restart your instances.{template_info}
+          
+Steps to recover:
+1. Go to EC2 Console > Launch Templates
+2. Select the appropriate launch template(s) listed above
+3. Click 'Launch instance from template'
+4. Verify instances are running and healthy
+          
+Check the failed instance in the EC2 Console to determine the cause of the status check failure."""
+                  
+                  sns = boto3.client("sns")
+                  sns.publish(
+                      TopicArn=email_sns_topic_arn,
+                      Message=message,
+                      Subject=f"URGENT: Instance {source_instance_id} Status Check Failure - Manual Recovery Required"
+                  )
+                  
+                  print("Notification sent successfully")
+                  
+              except Exception as e:
+                  print(f"Error sending notification: {str(e)}")
+                  raise
+
+  NotificationLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref NotificationLambda
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref LambdaSNSTopic
+
+  LambdaSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "Outpost Server Lambda Notification"
+      KmsMasterKeyId: !Ref KMSKey
+
+  LambdaSNSTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      Endpoint: !GetAtt NotificationLambda.Arn
+      TopicArn: !Ref LambdaSNSTopic
+
+  InstanceStatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Alarm when instance status check fails. Failure means StatusCheckFailed_Instance is 1 for 4 datapoints within 4 minutes. Manual recovery required - use launch templates to restart instances."
+      AlarmName: !Sub "InstanceStatusCheckAlarm-${AWS::StackName}"
+      EvaluationPeriods: 4
+      DatapointsToAlarm: 4
+      Threshold: 0
+      ComparisonOperator: "GreaterThanThreshold"
+      MetricName: "StatusCheckFailed_Instance"
+      Namespace: "AWS/EC2"
+      Statistic: "Maximum"
+      Period: 60
+      Dimensions:
+        - Name: "InstanceId"
+          Value: !Ref SourceInstanceId
+      AlarmActions:
+        - !Ref LambdaSNSTopic
+
+Outputs:
+  # Outputs will be dynamically inserted here
